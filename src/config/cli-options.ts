@@ -144,6 +144,47 @@ export const commands: Commands = {
       },
     },
   },
+  click_with_pressure: {
+    description:
+      'Clicks on the provided element like the click tool, but with a custom pointer pressure on the button presses. A real mouse reports a pressure of 0.5 while a button is pressed, while the click tool reports 0.',
+    category: 'Input automation',
+    args: {
+      pageId: {
+        name: 'pageId',
+        type: 'number',
+        description: 'Targets a specific page by ID.',
+        required: true,
+      },
+      uid: {
+        name: 'uid',
+        type: 'string',
+        description:
+          'The uid of an element on the page from the page content snapshot',
+        required: true,
+      },
+      pressure: {
+        name: 'pressure',
+        type: 'number',
+        description:
+          'The pointer pressure while the button is pressed, in the range [0, 1]. Default is 0.5, like a real mouse.',
+        required: false,
+        default: 0.5,
+      },
+      dblClick: {
+        name: 'dblClick',
+        type: 'boolean',
+        description: 'Set to true for double clicks. Default is false.',
+        required: false,
+      },
+      includeSnapshot: {
+        name: 'includeSnapshot',
+        type: 'boolean',
+        description:
+          'Whether to include a snapshot in the response. Default is false.',
+        required: false,
+      },
+    },
+  },
   close_heapsnapshot: {
     description:
       'Closes a previously loaded and cached memory heapsnapshot, freeing its memory. (requires flag: --memoryDebugging=true)',

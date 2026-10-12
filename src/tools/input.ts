@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {TimeoutError, zod} from '../third_party/index.js';
+import {CdpPage, TimeoutError, zod} from '../third_party/index.js';
 import type {ElementHandle, KeyInput} from '../third_party/index.js';
 import type {TextSnapshotNode} from '../types.js';
 import {parseKey} from '../utils/keyboard.js';
@@ -12,7 +12,7 @@ import {logger} from '../utils/logger.js';
 import type {WaitForEventsResult} from '../utils/WaitForHelper.js';
 
 import {ToolCategory} from './categories.js';
-import type {ContextPage} from './ToolDefinition.js';
+import type {ContextPage, Response} from './ToolDefinition.js';
 import {definePageTool} from './ToolDefinition.js';
 
 const dblClickSchema = zod
@@ -104,6 +104,56 @@ async function selectNativeSelectOption(
   return true;
 }
 
+/**
+ * Shared flow of the element click tools. Only `performClick` differs between
+ * them, so everything else (native option selection, dialogs, waiting for
+ * events after the action, response lines) stays identical.
+ */
+async function clickElement(
+  page: ContextPage,
+  params: {uid: string; dblClick?: boolean; includeSnapshot?: boolean},
+  response: Response,
+  performClick: (
+    handle: ElementHandle<Element>,
+    count: number,
+    signal: AbortSignal,
+  ) => Promise<void>,
+): Promise<void> {
+  const uid = params.uid;
+  using handle = await page.getElementByUid(uid);
+  const aXNode = page.getAXNodeByUid(uid);
+  const shouldSelectNativeOption =
+    !params.dblClick && aXNode?.role === 'option';
+  try {
+    const result = await page.waitForEventsAfterAction(async signal => {
+      if (
+        shouldSelectNativeOption &&
+        (await selectNativeSelectOption(handle, signal))
+      ) {
+        return;
+      }
+
+      await performClick(handle, params.dblClick ? 2 : 1, signal);
+    });
+    response.appendResponseLine(
+      params.dblClick
+        ? `Successfully double clicked on the element`
+        : `Successfully clicked on the element`,
+    );
+    response.attachWaitForResult(result);
+    if (params.includeSnapshot) {
+      response.includeSnapshot();
+    }
+  } catch (error) {
+    handleActionError(error, uid, page);
+    response.appendResponseLine(
+      params.dblClick
+        ? `The element was double clicked and it opened a dialog.`
+        : `The element was clicked and it opened a dialog.`,
+    );
+  }
+}
+
 export const click = definePageTool(() => ({
   name: 'click',
   description: `Clicks on the provided element`,
@@ -123,44 +173,130 @@ export const click = definePageTool(() => ({
   blockedByDialog: true,
   verifyFilesSchema: {},
   handler: async (request, response) => {
-    const uid = request.params.uid;
-    using handle = await request.page.getElementByUid(uid);
-    const aXNode = request.page.getAXNodeByUid(uid);
-    const shouldSelectNativeOption =
-      !request.params.dblClick && aXNode?.role === 'option';
-    try {
-      const result = await request.page.waitForEventsAfterAction(
-        async signal => {
-          if (
-            shouldSelectNativeOption &&
-            (await selectNativeSelectOption(handle, signal))
-          ) {
-            return;
-          }
+    await clickElement(
+      request.page,
+      request.params,
+      response,
+      async (handle, count, signal) => {
+        await handle.asLocator().click({count, signal});
+      },
+    );
+  },
+}));
 
-          await handle.asLocator().click({
-            count: request.params.dblClick ? 2 : 1,
-            signal,
-          });
-        },
-      );
-      response.appendResponseLine(
-        request.params.dblClick
-          ? `Successfully double clicked on the element`
-          : `Successfully clicked on the element`,
-      );
-      response.attachWaitForResult(result);
-      if (request.params.includeSnapshot) {
-        response.includeSnapshot();
+/**
+ * Same as `Locator.click()` but sets the CDP `force` on every button press.
+ *
+ * Puppeteer's `Mouse` does not forward `force`, so only the actionability
+ * checks are delegated to the locator: `scroll()` without scroll offsets runs
+ * the same checks as `click()` (in viewport, stable bounding box) and does
+ * nothing else, and the filter adds the enabled check that only `click()`
+ * performs. The rest mirrors `ElementHandle.click()` and `CdpMouse.click()`:
+ * the clickable point is computed once, and the move and every press and
+ * release are sent without waiting for each other, on the same CDP session.
+ * That way the releases are sent even if a press opens a dialog.
+ */
+async function clickWithForce(
+  handle: ElementHandle<Element>,
+  count: number,
+  force: number,
+  signal: AbortSignal,
+): Promise<void> {
+  await handle
+    .asLocator()
+    .filter(element => {
+      if (!(element instanceof HTMLElement)) {
+        return true;
       }
-    } catch (error) {
-      handleActionError(error, uid, request.page);
-      response.appendResponseLine(
-        request.params.dblClick
-          ? `The element was double clicked and it opened a dialog.`
-          : `The element was clicked and it opened a dialog.`,
-      );
-    }
+      const isNativeFormControl = [
+        'BUTTON',
+        'INPUT',
+        'SELECT',
+        'TEXTAREA',
+        'OPTION',
+        'OPTGROUP',
+      ].includes(element.nodeName);
+      return !isNativeFormControl || !element.hasAttribute('disabled');
+    })
+    .scroll({signal});
+  // `ElementHandle.scrollIntoViewIfNeeded()` is protected.
+  if (
+    !(await raceWithSignal(
+      handle.isIntersectingViewport({threshold: 1}),
+      signal,
+    ))
+  ) {
+    await raceWithSignal(handle.scrollIntoView(), signal);
+  }
+  const {x, y} = await raceWithSignal(handle.clickablePoint(), signal);
+  const page = handle.frame.page();
+  if (!(page instanceof CdpPage)) {
+    throw new Error('Clicking with pressure requires a CDP connection.');
+  }
+  const client = page._client();
+  const modifiers = page.keyboard._modifiers;
+  const actions: Array<Promise<unknown>> = [page.mouse.move(x, y)];
+  for (let clickCount = 1; clickCount <= count; clickCount++) {
+    actions.push(
+      client.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        modifiers,
+        clickCount,
+        buttons: 1,
+        button: 'left',
+        x,
+        y,
+        force,
+      }),
+      client.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        modifiers,
+        clickCount,
+        buttons: 0,
+        button: 'left',
+        x,
+        y,
+      }),
+    );
+  }
+  await raceWithSignal(Promise.all(actions), signal);
+}
+
+export const clickWithPressure = definePageTool(() => ({
+  name: 'click_with_pressure',
+  description: `Clicks on the provided element like the click tool, but with a custom pointer pressure on the button presses. A real mouse reports a pressure of 0.5 while a button is pressed, while the click tool reports 0.`,
+  annotations: {
+    category: ToolCategory.INPUT,
+    readOnlyHint: false,
+  },
+  schema: {
+    uid: zod
+      .string()
+      .describe(
+        'The uid of an element on the page from the page content snapshot',
+      ),
+    pressure: zod
+      .number()
+      .min(0)
+      .max(1)
+      .default(0.5)
+      .describe(
+        'The pointer pressure while the button is pressed, in the range [0, 1]. Default is 0.5, like a real mouse.',
+      ),
+    dblClick: dblClickSchema,
+    includeSnapshot: includeSnapshotSchema,
+  },
+  blockedByDialog: true,
+  verifyFilesSchema: {},
+  handler: async (request, response) => {
+    await clickElement(
+      request.page,
+      request.params,
+      response,
+      async (handle, count, signal) => {
+        await clickWithForce(handle, count, request.params.pressure, signal);
+      },
+    );
   },
 }));
 

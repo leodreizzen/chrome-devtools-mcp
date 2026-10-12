@@ -11,8 +11,10 @@ import sinon from 'sinon';
 
 import {McpResponse} from '../../src/McpResponse.js';
 import {TextSnapshot} from '../../src/TextSnapshot.js';
+import {CdpPage} from '../../src/third_party/index.js';
 import {
   click,
+  clickWithPressure,
   hover,
   fill,
   drag,
@@ -34,6 +36,13 @@ import {
   withMcpContext,
   getTextContent,
 } from '../utils.js';
+
+declare global {
+  interface Window {
+    events: Array<Record<string, unknown>>;
+    dblclicks: number;
+  }
+}
 
 describe('input', () => {
   const server = serverHooks();
@@ -490,6 +499,296 @@ describe('input', () => {
         'The element was double clicked and it opened a dialog.',
       );
       sinon.assert.notCalled(response.includeSnapshot);
+    });
+  });
+
+  describe('click_with_pressure', () => {
+    function eventLoggingPage({
+      style = '',
+      buttonAttributes = '',
+    }: {style?: string; buttonAttributes?: string} = {}) {
+      return html`<style>
+          ${style}
+        </style>
+        <div style="height: 2000px"></div>
+        <button
+          style="width: 120px; height: 40px"
+          ondblclick="window.dblclicks++"
+          ${buttonAttributes}
+          >test</button
+        >
+        <script>
+          window.events = [];
+          window.dblclicks = 0;
+          const button = document.querySelector('button');
+          for (const type of [
+            'pointerover',
+            'pointerenter',
+            'pointermove',
+            'pointerdown',
+            'pointerup',
+            'mouseover',
+            'mouseenter',
+            'mousemove',
+            'mousedown',
+            'mouseup',
+            'click',
+            'dblclick',
+          ]) {
+            button.addEventListener(type, e => {
+              window.events.push({
+                type: e.type,
+                isTrusted: e.isTrusted,
+                clientX: e.clientX,
+                clientY: e.clientY,
+                button: e.button,
+                buttons: e.buttons,
+                detail: e.detail,
+                pointerId: e.pointerId,
+                pointerType: e.pointerType,
+                pressure: e.pressure,
+                width: e.width,
+                height: e.height,
+                tiltX: e.tiltX,
+                tiltY: e.tiltY,
+                twist: e.twist,
+              });
+            });
+          }
+        </script>`;
+    }
+
+    async function recordClick(
+      clickTool: typeof click | typeof clickWithPressure,
+      params: {dblClick?: boolean; pressure?: number},
+      options: {content?: string; acceptDialog?: boolean} = {},
+    ) {
+      let result:
+        | {
+            mouseEvents: unknown[];
+            domEvents: Array<Record<string, unknown>>;
+            dblclicks: number;
+          }
+        | undefined;
+      await withMcpContext(async (response, context, args) => {
+        const mcpPage = context.getSelectedMcpPage();
+        const page = mcpPage.pptrPage;
+        await page.setContent(options.content ?? eventLoggingPage());
+        mcpPage.textSnapshot = await TextSnapshot.create(mcpPage);
+        await page.mouse.move(0, 0);
+        assert.ok(page instanceof CdpPage);
+        const send = sinon.spy(page._client(), 'send');
+
+        await clickTool(args).handler(
+          {
+            params: {uid: '1_1', pressure: 0.5, ...params},
+            page: mcpPage,
+          },
+          response,
+          context,
+        );
+        if (options.acceptDialog) {
+          await mcpPage.getDialog()?.accept();
+          await page.waitForFunction(() => {
+            return window.events.some(event => event.type === 'click');
+          });
+        }
+
+        result = {
+          mouseEvents: send
+            .getCalls()
+            .filter(call => call.args[0] === 'Input.dispatchMouseEvent')
+            .map(call => call.args[1]),
+          domEvents: await page.evaluate(() => window.events),
+          dblclicks: await page.evaluate(() => window.dblclicks),
+        };
+      });
+      assert.ok(result);
+      return result;
+    }
+
+    function withoutForce(mouseEvents: unknown[]) {
+      return mouseEvents.map(event => {
+        assert.ok(event && typeof event === 'object');
+        return Object.fromEntries(
+          Object.entries(event).filter(([key]) => key !== 'force'),
+        );
+      });
+    }
+
+    for (const dblClick of [false, true]) {
+      const clickCount = dblClick ? 2 : 1;
+
+      it(`sends the same CDP mouse events as click with the given force (dblClick: ${dblClick})`, async () => {
+        const expected = await recordClick(click, {dblClick});
+        const actual = await recordClick(clickWithPressure, {
+          dblClick,
+          pressure: 0.5,
+        });
+
+        assert.deepStrictEqual(
+          withoutForce(actual.mouseEvents),
+          expected.mouseEvents,
+        );
+        assert.strictEqual(actual.mouseEvents.length, 1 + 2 * clickCount);
+        for (const event of actual.mouseEvents) {
+          assert.ok(event && typeof event === 'object' && 'type' in event);
+          assert.deepStrictEqual(
+            'force' in event ? event.force : undefined,
+            event.type === 'mousePressed' ? 0.5 : undefined,
+          );
+        }
+      });
+
+      it(`produces the same DOM events as click except for the pressure (dblClick: ${dblClick})`, async () => {
+        const expected = await recordClick(click, {dblClick});
+        const actual = await recordClick(clickWithPressure, {
+          dblClick,
+          pressure: 0.5,
+        });
+
+        assert.strictEqual(expected.dblclicks, dblClick ? 1 : 0);
+        assert.strictEqual(actual.dblclicks, expected.dblclicks);
+        assert.deepStrictEqual(
+          actual.domEvents,
+          expected.domEvents.map(event =>
+            event.type === 'pointerdown' ? {...event, pressure: 0.5} : event,
+          ),
+        );
+        assert.ok(
+          expected.domEvents.some(
+            event => event.type === 'pointerdown' && event.pressure === 0,
+          ),
+        );
+      });
+    }
+
+    it('produces the same DOM events as click with a pressure of 0', async () => {
+      const expected = await recordClick(click, {});
+      const actual = await recordClick(clickWithPressure, {pressure: 0});
+
+      assert.deepStrictEqual(actual.domEvents, expected.domEvents);
+    });
+
+    it('clicks at the same point as click when hovering moves the element', async () => {
+      const content = eventLoggingPage({
+        style: 'button:hover { transform: translateX(30px); }',
+      });
+      const expected = await recordClick(click, {}, {content});
+      const actual = await recordClick(
+        clickWithPressure,
+        {pressure: 0},
+        {content},
+      );
+
+      assert.deepStrictEqual(actual.domEvents, expected.domEvents);
+      assert.deepStrictEqual(
+        withoutForce(actual.mouseEvents),
+        expected.mouseEvents,
+      );
+    });
+
+    it('releases the button when the press opens a dialog', async () => {
+      const content = eventLoggingPage({
+        buttonAttributes: 'onmousedown="alert(\'down\')"',
+      });
+      const expected = await recordClick(
+        click,
+        {},
+        {content, acceptDialog: true},
+      );
+      const actual = await recordClick(
+        clickWithPressure,
+        {pressure: 0},
+        {content, acceptDialog: true},
+      );
+
+      assert.deepStrictEqual(actual.domEvents, expected.domEvents);
+      assert.deepStrictEqual(
+        actual.domEvents
+          .map(event => event.type)
+          .filter(type => type !== 'pointermove' && type !== 'mousemove'),
+        [
+          'pointerover',
+          'pointerenter',
+          'mouseover',
+          'mouseenter',
+          'pointerdown',
+          'mousedown',
+          'pointerup',
+          'mouseup',
+          'click',
+        ],
+      );
+    });
+
+    it('waits for a disabled button to become enabled', async () => {
+      await withMcpContext(async (response, context, args) => {
+        const mcpPage = context.getSelectedMcpPage();
+        const page = mcpPage.pptrPage;
+        await page.setContent(
+          html`<button
+            disabled
+            onclick="this.innerText = 'clicked';"
+            >test</button
+          >`,
+        );
+        mcpPage.textSnapshot = await TextSnapshot.create(mcpPage);
+        await page.evaluate(() => {
+          setTimeout(() => {
+            document.querySelector('button')?.removeAttribute('disabled');
+          }, 500);
+        });
+
+        await clickWithPressure(args).handler(
+          {
+            params: {uid: '1_1', pressure: 0.5},
+            page: mcpPage,
+          },
+          response,
+          context,
+        );
+
+        assert.strictEqual(
+          response.responseLines[0],
+          'Successfully clicked on the element',
+        );
+        assert.ok(await page.$('text/clicked'));
+      });
+    });
+
+    it('does not fail when the click opens a dialog', async () => {
+      await withMcpContext(async (response, context, args) => {
+        const mcpPage = context.getSelectedMcpPage();
+        const page = mcpPage.pptrPage;
+        await page.setContent(
+          html`<button onclick="alert('Are you sure?')">test</button>`,
+        );
+        mcpPage.textSnapshot = await TextSnapshot.create(mcpPage);
+
+        await clickWithPressure(args).handler(
+          {
+            params: {uid: '1_1', pressure: 0.5},
+            page: mcpPage,
+          },
+          response,
+          context,
+        );
+
+        assert.strictEqual(
+          response.responseLines[0],
+          'The element was clicked and it opened a dialog.',
+        );
+      });
+    });
+
+    it('defaults the pressure to 0.5', () => {
+      const {args} = createHandlerMocks();
+
+      assert.strictEqual(
+        clickWithPressure(args).schema.pressure.parse(undefined),
+        0.5,
+      );
     });
   });
 

@@ -2,8 +2,9 @@
 
 # Chrome DevTools MCP Tool Reference
 
-- **[Input automation](#input-automation)** (10 tools)
+- **[Input automation](#input-automation)** (11 tools)
   - [`click`](#click)
+  - [`click_with_pressure`](#click_with_pressure)
   - [`drag`](#drag)
   - [`fill`](#fill)
   - [`fill_form`](#fill_form)
@@ -85,6 +86,20 @@
 - **uid** (string) **(required)**: The uid of an element on the page from the page content snapshot
 - **dblClick** (boolean) _(optional)_: Set to true for double clicks. Default is false.
 - **includeSnapshot** (boolean) _(optional)_: Whether to include a snapshot in the response. Default is false.
+
+---
+
+### `click_with_pressure`
+
+**Description:** Clicks on the provided element like the [`click`](#click) tool, but with a custom pointer pressure on the button presses. A real mouse reports a pressure of 0.5 while a button is pressed, while the [`click`](#click) tool reports 0.
+
+**Parameters:**
+
+- **pageId** (number) **(required)**: Targets a specific page by ID.
+- **uid** (string) **(required)**: The uid of an element on the page from the page content snapshot
+- **dblClick** (boolean) _(optional)_: Set to true for double clicks. Default is false.
+- **includeSnapshot** (boolean) _(optional)_: Whether to include a snapshot in the response. Default is false.
+- **pressure** (number) _(optional)_: The pointer pressure while the button is pressed, in the range [0, 1]. Default is 0.5, like a real mouse.
 
 ---
 

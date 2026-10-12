@@ -1330,5 +1330,26 @@
         "argType": "number"
       }
     ]
+  },
+  {
+    "name": "click_with_pressure",
+    "args": [
+      {
+        "name": "page_id",
+        "argType": "number"
+      },
+      {
+        "name": "pressure",
+        "argType": "number"
+      },
+      {
+        "name": "dbl_click",
+        "argType": "boolean"
+      },
+      {
+        "name": "include_snapshot",
+        "argType": "boolean"
+      }
+    ]
   }
 ]
